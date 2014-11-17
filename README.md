@@ -1,14 +1,19 @@
 ------------------------------------------------------
--- lib Random Forest [1] (libRF)                    --
+lib Random Forest (libRF)
 ------------------------------------------------------
+Test Status:
+[![Build Status](https://magnum.travis-ci.com/Sumukh/ParallelRF.svg?token=NdwRmsyfoFUF1zEjsQkw&branch=master)](https://magnum.travis-ci.com/Sumukh/ParallelRF)
 
 Content:
+
 1. Installing
 2. Executing
 3. References
 
 ------------------------------------------------------
+
 1. Installing
+
 1.1 Dependencies
 
 None except for STL.
