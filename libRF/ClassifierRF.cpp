@@ -26,6 +26,7 @@
 
 #include <string.h>
 #include <omp.h>
+#include <xmmintrin.h>
 
 #include "ClassifierRF.h"
 #include "Features.h"
@@ -40,33 +41,46 @@
 #define LOG2(x) std::log(x)/0.693147180559945
 #define MY_MAX(a,b) (((a)>=(b)) ? (a) : (b))
 
-template <class T>
-ClassifierRF<T>::ClassifierRF(typename ClassifierGeneral<T>::parameter_type* clfp) {
-	params = static_cast<SpecialParams*>(clfp);
+
+ClassifierRF::ClassifierRF(size_t num, size_t numT, FeaturesTable* f) {
+	numTrees = num;
+	numThreads = numT;
+	feat = f;
+	RFHeadNodes = new RFNode*[numTrees];
+	omp_set_num_threads(numThreads);	
 }
 
-template <class T>
-ClassifierRF<T>::~ClassifierRF() {
-	if(ClassifierGeneral<T>::feat!=NULL) {
-		ClassifierGeneral<T>::feat->ClearFeat();
+
+ClassifierRF::~ClassifierRF() {
+	if(feat!=NULL) {
+		feat->ClearFeat();
 	}
 	ClearCLF();
 }
 
-template <class T>
-int ClassifierRF<T>::ClearCLF() {
-	for(typename std::vector<struct RFNode*>::iterator v=RFHeadNodes.begin(),v_e=RFHeadNodes.end();v!=v_e;++v) {
-		if(*v!=NULL) {
-			ClearNode(*v);
-			delete *v;
-			*v = NULL;
+int ClassifierRF::ClearCLF() {
+	// for(typename std::vector<struct RFNode*>::iterator v=RFHeadNodes.begin(),v_e=RFHeadNodes.end();v!=v_e;++v) {
+	// 	if(*v!=NULL) {
+	// 		ClearNode(*v);
+	// 		delete *v;
+	// 		*v = NULL;
+	// 	}
+	// }
+
+	for(size_t i = 0; i< numTrees; i++) {
+		RFNode *v = RFHeadNodes[i];
+		if(v!=NULL) {
+			ClearNode(v);
+			delete v;
+			v = NULL;
 		}
+
 	}
+	delete RFHeadNodes;
 	return 0;
 }
 
-template <class T>
-int ClassifierRF<T>::ClearNode(struct RFNode* v) {
+int ClassifierRF::ClearNode(RFNode* v) {
 	if(v->dist!=NULL) {
 		delete [] v->dist;
 		v->dist = NULL;
@@ -84,8 +98,7 @@ int ClassifierRF<T>::ClearNode(struct RFNode* v) {
 	return 0;
 }
 
-template <class T>
-double ClassifierRF<T>::randBetween(double From, double To, size_t resolution) {
+double ClassifierRF::randBetween(double From, double To, size_t resolution) {
 	double r;
 	if(resolution<RAND_MAX)
 		r = (double)rand()/RAND_MAX;
@@ -105,33 +118,120 @@ double ClassifierRF<T>::randBetween(double From, double To, size_t resolution) {
 	return From + r * (To-From);
 }
 
-template <class T>
-int ClassifierRF<T>::Learn() {
+__m128 ClassifierRF::scan_SSE(__m128 x) {
+    x = _mm_add_ps(x, _mm_castsi128_ps(_mm_slli_si128(_mm_castps_si128(x), 4))); 
+    x = _mm_add_ps(x, _mm_shuffle_ps(_mm_setzero_ps(), x, 0x40)); 
+    return x;
+}
+
+float ClassifierRF::pass1_SSE(float *a, float *s, const int n) {
+    __m128 offset = _mm_setzero_ps();
+    #pragma omp for schedule(static) nowait
+    for (int i = 0; i < n / 4; i++) {
+        __m128 x = _mm_load_ps(&a[4 * i]);
+        __m128 out = scan_SSE(x);
+        out = _mm_add_ps(out, offset);
+        _mm_store_ps(&s[4 * i], out);
+        offset = _mm_shuffle_ps(out, out, _MM_SHUFFLE(3, 3, 3, 3));
+    }
+    float tmp[4];
+    _mm_store_ps(tmp, offset);
+    return tmp[3];
+}
+
+void ClassifierRF::pass2_SSE(float *s, __m128 offset, const int n) {
+    #pragma omp for schedule(static)
+    for (int i = 0; i<n/4; i++) {
+        __m128 tmp1 = _mm_load_ps(&s[4 * i]);
+        tmp1 = _mm_add_ps(tmp1, offset);
+        _mm_store_ps(&s[4 * i], tmp1);
+    }
+}
+
+void ClassifierRF::scan_omp_SSEp2_SSEp1_chunk(float a[], float s[], int n) {
+    float *suma;
+    const int chunk_size = 1<<18;
+    const int nchunks = n%chunk_size == 0 ? n / chunk_size : n / chunk_size + 1;
+    //printf("nchunks %d\n", nchunks);
+    #pragma omp parallel
+    {
+        const int ithread = omp_get_thread_num();
+        const int nthreads = omp_get_num_threads();
+
+        #pragma omp single
+        {
+            suma = new float[nthreads + 1];
+            suma[0] = 0;
+        }
+
+        float offset2 = 0.0f;
+        for (int c = 0; c < nchunks; c++) {
+            const int start = c*chunk_size;
+            const int chunk = (c + 1)*chunk_size < n ? chunk_size : n - c*chunk_size;
+            suma[ithread + 1] = pass1_SSE(&a[start], &s[start], chunk);
+            #pragma omp barrier
+            #pragma omp single
+            {
+                float tmp = 0;
+                for (int i = 0; i < (nthreads + 1); i++) {
+                    tmp += suma[i];
+                    suma[i] = tmp;
+                }
+            }
+            __m128 offset = _mm_set1_ps(suma[ithread]+offset2);
+            pass2_SSE(&s[start], offset, chunk);
+            #pragma omp barrier
+            offset2 = s[start + chunk-1];
+        }
+    }
+    delete[] suma;
+}
+
+int ClassifierRF::Learn() {
 	//std::cout << "Learning started..." << std::endl;
 
-	size_t numAttr = ClassifierGeneral<T>::feat->NumFeatures();
+	size_t numAttr = feat->NumFeatures();
 	size_t AttributesToSample = MY_MAX(1, size_t(std::ceil(std::sqrt(double(numAttr)))));
 	//AttributesToSample = MY_MAX(1, 1+size_t(LOG2(double(numAttr))));
+	//std::cout << "Num Attributes" << numAttr <<std::endl;
 
-	//uniform distribution over attributes
-	std::vector<double> wAttr(numAttr, 1.0/numAttr);
-	std::partial_sum(wAttr.begin(), wAttr.end(), wAttr.begin(), std::plus<double>());
-	wAttr.back() = 1.01;
+	double wAttr[numAttr];
+	float t = 1.0/numAttr;
+	bool sse_enabled = true;
+	if (sse_enabled) {
+		float wAttrTmp[numAttr];
+		float wAttrTmp2[numAttr];
+		#pragma omp parallel for schedule(dynamic)
+		for(size_t i=0; i < numAttr; i++)
+		{
+			wAttrTmp[i] = t;
+		}
+		scan_omp_SSEp2_SSEp1_chunk(wAttrTmp, wAttrTmp2, numAttr);
+		#pragma omp parallel for schedule(dynamic)
+		for(size_t i=0; i < numAttr; i++)
+		{
+			wAttr[i] = wAttrTmp2[i];
+		}
+	} else {
+		#pragma omp parallel for schedule(dynamic)
+		for(size_t i=0; i < numAttr; i++)
+		{
+			wAttr[i] = t;
+		}
+		std::partial_sum(wAttr, wAttr+numAttr, wAttr); // <-- SSE ?
+	}
 
-	const std::vector<size_t>* dist = ClassifierGeneral<T>::feat->GetClassDistribution();
+	wAttr[numAttr-1] = 1.01;
 
-	RFHeadNodes.assign(params->numTrees, NULL);
-
-	srand(1);
-
-	omp_set_num_threads(16);
-
-	#pragma omp parallel for
-	for(size_t k=0;k<params->numTrees;++k) {
+	const std::vector<size_t>* dist = feat->GetClassDistribution();
+	#pragma omp parallel for schedule(dynamic)
+	for(size_t k=0;k<numTrees;++k) {
 		//set class uniform data weights
 		std::vector<std::vector<double> > DataWeights(dist->size(), std::vector<double>());
+		//std::cout << "Dist size " << dist->size() << std::endl;
 		for(size_t m=0;m<dist->size();++m) {
 			DataWeights[m].assign(dist->at(m), 1.0/dist->at(m));
+			// std::cout << "size used in assign " << dist->at(m) << std::endl;
 		}
 
 		//sample data
@@ -139,24 +239,25 @@ int ClassifierRF<T>::Learn() {
 		WeightedSampling(dist, DataWeights, oobIdx, ibIdx, ibRep);
 
 		//initialize tree
-		RFHeadNodes[k] = new struct RFNode;
-		RFHeadNodes[k]->dist = new T[dist->size()];
+		RFHeadNodes[k] = new RFNode();
+		RFHeadNodes[k]->dist = new double[dist->size()];
 		std::vector<size_t> cls;
-		ClassifierGeneral<T>::feat->GetClassDistribution(RFHeadNodes[k]->dist, &cls, ibIdx);
+		feat->GetClassDistribution(RFHeadNodes[k]->dist, &cls, ibIdx);
 
-		ConstructTree(RFHeadNodes[k], ibIdx, cls, wAttr, AttributesToSample);
+		ConstructTree(RFHeadNodes[k], ibIdx, cls, wAttr, numAttr, AttributesToSample);
 
 		cls.clear();
-		ClassifierGeneral<T>::feat->GetClassDistribution(NULL, &cls, oobIdx);
-		std::vector<T> distri;
+		feat->GetClassDistribution(NULL, &cls, oobIdx);
 		size_t error = 0;
 		for(size_t m=0;m<oobIdx.size();++m) {
-			distri.assign(dist->size(), T(0.0));
-			ClassifyTree(RFHeadNodes[k], oobIdx[m], distri);
-			size_t predCls = std::max_element(distri.begin(), distri.end())-distri.begin();
+			double* distri = new double[dist->size()];
+			std::fill_n(distri, dist->size(), 0.0); 
+			ClassifyTree(RFHeadNodes[k], oobIdx[m], distri,dist->size());
+			size_t predCls = std::max_element(distri, distri + dist->size())-distri; 
 			if(predCls!=cls[m]) {
 				++error;
 			}
+			delete [] distri;
 		}
 
 		//std::cout << "Performance Tree " << k << ": " << T(error)/oobIdx.size() << std::endl;
@@ -166,53 +267,63 @@ int ClassifierRF<T>::Learn() {
 	return 0;
 }
 
-template <class T>
-int ClassifierRF<T>::ClassifyTree(struct RFNode* node, size_t dataIdx, std::vector<T>& distri) {
+
+int ClassifierRF::ClassifyTree(RFNode* node, size_t dataIdx, double* distri, size_t distri_size) {
 	while(node->NodeLarger!=NULL && node->NodeSmaller!=NULL) {
-		if(ClassifierGeneral<T>::feat->FeatureResponse(dataIdx, node->featID)<=node->splitVal) {
+		if(feat->FeatureResponse(dataIdx, node->featID)<=node->splitVal) {
 			node = node->NodeSmaller;
 		} else {
 			node = node->NodeLarger;
 		}
 	}
-	T* d = node->dist;
-	for(typename std::vector<T>::iterator p=distri.begin(),p_e=distri.end();p!=p_e;++p, ++d) {
+	double* d = node->dist;
+	// for(typename std::vector<double>::iterator p=distri.begin(),p_e=distri.end();p!=p_e;++p, ++d) {
+	// 	*p += *d;
+	// }
+	double* p = distri;
+	for (size_t i = 0; i < distri_size ; i++) // <-- SSE no omp (order matters)
+	{
 		*p += *d;
+		++p;
+		++d;
 	}
 	return 0;
 }
 
-template <class T>
-int ClassifierRF<T>::Classify(size_t dataIdx, std::vector<T>& distri) {
-	for(typename std::vector<struct RFNode*>::iterator node=RFHeadNodes.begin(),node_e=RFHeadNodes.end();node!=node_e;++node) {
-		ClassifyTree(*node, dataIdx, distri);
+int ClassifierRF::Classify(size_t dataIdx,double* distri, size_t distri_size) {
+	// for(typename std::vector<struct RFNode*>::iterator node=RFHeadNodes.begin(),node_e=RFHeadNodes.end();node!=node_e;++node) {
+	// 	ClassifyTree(*node, dataIdx, distri);
+	// }
+
+	for(size_t i = 0; i < numTrees; i++)
+	{
+		ClassifyTree(RFHeadNodes[i], dataIdx, distri, distri_size);
 	}
 	return 0;
 }
 
-template <class T>
-int ClassifierRF<T>::ConstructTree(struct RFNode* head, std::vector<size_t>& dataIdx, std::vector<size_t>& cls, std::vector<double>& wAttr, size_t AttributesToSample) {
+int ClassifierRF::ConstructTree(RFNode* head, std::vector<size_t>& dataIdx, std::vector<size_t>& cls, double* wAttr,size_t wAttrSize, size_t AttributesToSample) {
 	if(stoppingCriteria(head)) {
 		cls.clear();
 		dataIdx.clear();
 		return 0;
 	}
 
-	size_t numCls = ClassifierGeneral<T>::feat->NumClasses();
+	size_t numCls = feat->NumClasses();
 
 	int maxTries = 10;
 	while(maxTries>0) {
-		std::vector<int> selAttr(wAttr.size(), 0);
-		whichAttributes(wAttr, AttributesToSample, selAttr);
+		std::vector<int> selAttr(wAttrSize, 0);
+		whichAttributes(wAttr, wAttrSize, AttributesToSample, selAttr);
 
-		T BestSplitVal = 0;
+		double BestSplitVal = 0;
 		double BestEstimation = -std::numeric_limits<double>::max();
 		size_t bestAttr = size_t(-1);
 		
     //Just trying this out TODO
-    #pragma omp parallel for
+     #pragma omp parallel for
     for(size_t k=0;k<selAttr.size();k++) {
-			T splitVal;
+			double splitVal;
 			double est;
 			if(selAttr[k]!=0) {
 				ImpuritySplit(dataIdx, cls, k, &splitVal, &est);
@@ -242,15 +353,16 @@ int ClassifierRF<T>::ConstructTree(struct RFNode* head, std::vector<size_t>& dat
 
 	//split data
 	std::vector<size_t> dataIdxSmaller,dataIdxLarger,clsSmaller,clsLarger;
-	T* distriSmaller = new T[numCls];
-	std::fill(distriSmaller, distriSmaller+numCls, T(0.0));
-	T* distriLarger = new T[numCls];
-	std::fill(distriLarger, distriLarger+numCls, T(0.0));
+	double* distriSmaller = new double[numCls];
+	std::fill(distriSmaller, distriSmaller+numCls, 0.0);
+	//std::cout << "numCls " <<numCls << std::endl;
+	double* distriLarger = new double[numCls];
+	std::fill(distriLarger, distriLarger+numCls, 0.0);
   
   //TODO
-  #pragma omp parallel for 
+   #pragma omp parallel for 
   for(size_t k=0;k<dataIdx.size();++k) {
-		if(ClassifierGeneral<T>::feat->FeatureResponse(dataIdx[k],head->featID)<=head->splitVal) {
+		if(feat->FeatureResponse(dataIdx[k],head->featID)<=head->splitVal) {
 			dataIdxSmaller.push_back(dataIdx[k]);
 			++distriSmaller[cls[k]];
 			clsSmaller.push_back(cls[k]);
@@ -267,12 +379,12 @@ int ClassifierRF<T>::ConstructTree(struct RFNode* head, std::vector<size_t>& dat
 
 	//new nodes
 	if(dataIdxSmaller.size()>0 && dataIdxLarger.size()>0) {
-		head->NodeSmaller = new struct RFNode;
+		head->NodeSmaller = new RFNode();
 		head->NodeSmaller->dist = distriSmaller;
-		head->NodeLarger = new struct RFNode;
+		head->NodeLarger = new RFNode();
 		head->NodeLarger->dist = distriLarger;
-		ConstructTree(head->NodeSmaller, dataIdxSmaller, clsSmaller, wAttr, AttributesToSample);
-		ConstructTree(head->NodeLarger, dataIdxLarger, clsLarger, wAttr, AttributesToSample);
+		ConstructTree(head->NodeSmaller, dataIdxSmaller, clsSmaller, wAttr, wAttrSize, AttributesToSample);
+		ConstructTree(head->NodeLarger, dataIdxLarger, clsLarger, wAttr, wAttrSize, AttributesToSample);
 	} else {
 		delete [] distriSmaller;
 		delete [] distriLarger;
@@ -286,14 +398,14 @@ int ClassifierRF<T>::ConstructTree(struct RFNode* head, std::vector<size_t>& dat
 	return 0;
 }
 
-template <class T>
-int ClassifierRF<T>::ImpuritySplit(std::vector<size_t>& dataIdx, std::vector<size_t>& cls, size_t featureId, T* splitVal, double* bestEstimation) {
-	size_t numCls = ClassifierGeneral<T>::feat->NumClasses();
-	std::multimap<T, size_t> split_points;
+
+int ClassifierRF::ImpuritySplit(std::vector<size_t>& dataIdx, std::vector<size_t>& cls, size_t featureId, double* splitVal, double* bestEstimation) {
+	size_t numCls = feat->NumClasses();
+	std::multimap<double, size_t> split_points;
 	size_t *tab = new size_t[2*numCls];
 	memset(tab,0,2*numCls*sizeof(size_t));
 	for(size_t k=0;k<dataIdx.size();k++) {
-		split_points.insert(std::make_pair<T, size_t>(ClassifierGeneral<T>::feat->FeatureResponse(dataIdx[k],featureId),k));
+		split_points.insert(std::make_pair<double, size_t>(feat->FeatureResponse(dataIdx[k],featureId),k));
 
 		size_t position = cls[k];
 		++tab[2*position+1];			//store everything on the right hand side
@@ -311,15 +423,15 @@ int ClassifierRF<T>::ImpuritySplit(std::vector<size_t>& dataIdx, std::vector<siz
 	//double test = ImpurityGain(priorImp, split_points.size(), noAttrVal, noClassesAttrVal, numCls);		//yields zero!!!
 
 	*bestEstimation = -std::numeric_limits<double>::max();
-	typename std::multimap<T, size_t>::iterator lastDifferent = split_points.begin();
-	*splitVal = -std::numeric_limits<T>::max();
+	typename std::multimap<double, size_t>::iterator lastDifferent = split_points.begin();
+	*splitVal = -std::numeric_limits<double>::max();
 
 	//shift points to left
 	size_t position = cls[lastDifferent->second];
 	--tab[2*position+1];		//remove variable from right hand side
 	++tab[2*position];			//add variable to left hand side
 
-	typename std::multimap<T, size_t>::iterator iter=lastDifferent;
+	typename std::multimap<double, size_t>::iterator iter=lastDifferent;
 	++iter;
 	for(;iter!=split_points.end();++iter, ++cnt) {
 		if(lastDifferent->first!=iter->first) {
@@ -328,7 +440,7 @@ int ClassifierRF<T>::ImpuritySplit(std::vector<size_t>& dataIdx, std::vector<siz
 			double est = GiniImpurityGain(priorImp, split_points.size(), numLR, tab, numCls);
 			if (est > *bestEstimation) {
 				*bestEstimation = est;
-    			*splitVal = (iter->first + lastDifferent->first)/T(2.0) ;
+    			*splitVal = (iter->first + lastDifferent->first)/2.0 ;
     		}
     		lastDifferent = iter;
 		}
@@ -343,34 +455,41 @@ int ClassifierRF<T>::ImpuritySplit(std::vector<size_t>& dataIdx, std::vector<siz
 	return 0;
 }
 
-template <class T>
-double ClassifierRF<T>::GiniImpurity(size_t weight, size_t* tab, size_t valIdx, size_t numClasses) {
+
+double ClassifierRF::GiniImpurity(size_t weight, size_t* tab, size_t valIdx, size_t numClasses) {
 	double gi = 0.0;
     for(size_t classIdx=0;classIdx<numClasses;++classIdx)
 		gi += sqr(double(tab[2*classIdx+valIdx])/weight);
     return  gi;
 }
 
-template <class T>
-double ClassifierRF<T>::GiniImpurityGain(double priorImp, size_t weight, size_t* numLR, size_t* tab, size_t numClasses) {
+
+double ClassifierRF::GiniImpurityGain(double priorImp, size_t weight, size_t* numLR, size_t* tab, size_t numClasses) {
 	double tempP, gini=0.0;
-    for(int valIdx=0;valIdx<2;++valIdx) {		//loop over left and right side
-	   tempP = double(numLR[valIdx])/weight;
-	   if (numLR[valIdx]>0)
-         gini += tempP * GiniImpurity(numLR[valIdx], tab, valIdx, numClasses);
-    }
+    // for(int valIdx=0;valIdx<2;++valIdx) {		//loop over left and right side
+	   // tempP = double(numLR[valIdx])/weight;
+	   // if (numLR[valIdx]>0)
+    //      gini += tempP * GiniImpurity(numLR[valIdx], tab, valIdx, numClasses);
+    // }
+
+	tempP = double(numLR[0])/weight;
+	if (numLR[0]>0)
+        gini += tempP * GiniImpurity(numLR[0], tab, 0, numClasses);
+    tempP = double(numLR[1])/weight;
+	if (numLR[1]>0)
+        gini += tempP * GiniImpurity(numLR[1], tab, 1, numClasses);
+   
     return (gini - priorImp);
 }
 
-template <class T>
-inline double ClassifierRF<T>::sqr(double x) {
+
+inline double ClassifierRF::sqr(double x) {
 	return x*x;
 }
 
-template <class T>
-int ClassifierRF<T>::whichAttributes(std::vector<double>& wAttr, size_t AttributesToSample, std::vector<int>& selAttr) {
+int ClassifierRF::whichAttributes(double* wAttr, size_t wAttrSize, size_t AttributesToSample, std::vector<int>& selAttr) {
 	double rndNum;
-	size_t i=0, totalNumAttr = wAttr.size(), j; 
+	size_t i=0, totalNumAttr = wAttrSize, j; 
 	while(i < AttributesToSample) {
 		rndNum = randBetween(0.0, 1.0, totalNumAttr);
 		for(j=0;j < totalNumAttr; ++j) {
@@ -385,10 +504,10 @@ int ClassifierRF<T>::whichAttributes(std::vector<double>& wAttr, size_t Attribut
 	return 0;
 }
 
-template <class T>
-bool ClassifierRF<T>::stoppingCriteria(struct RFNode* node) {
-	size_t numCls = ClassifierGeneral<T>::feat->NumClasses();
-	T sum = std::accumulate(node->dist, node->dist+numCls, T(0.0));
+
+bool ClassifierRF::stoppingCriteria(RFNode* node) {
+	size_t numCls = feat->NumClasses();
+	double sum = std::accumulate(node->dist, node->dist+numCls, 0.0);
 
 	if(sum<5)
 		return true;
@@ -399,16 +518,16 @@ bool ClassifierRF<T>::stoppingCriteria(struct RFNode* node) {
 	return false;
 }
 
-template <class T>
-int ClassifierRF<T>::WeightedSampling(const std::vector<size_t>* SamplesPerClass, std::vector<std::vector<double> >& DataWeights, std::vector<size_t>& oobIdx, std::vector<size_t>& ibIdx, std::vector<size_t>& ibRep) {
-	std::vector<std::vector<double> > sortedWeights;
 
+int ClassifierRF::WeightedSampling(const std::vector<size_t>* SamplesPerClass, std::vector<std::vector<double> >& DataWeights, std::vector<size_t>& oobIdx, std::vector<size_t>& ibIdx, std::vector<size_t>& ibRep) {
+	std::vector<std::vector<double> > sortedWeights;
 	size_t NumClasses = SamplesPerClass->size();
 	sortedWeights.resize(NumClasses);
-
+	//std::cout << "NumClasses " << NumClasses << std::endl;
 	for(size_t k=0;k<NumClasses;++k) {
 		size_t validSamples = 0;
 		size_t numSampleReq = SamplesPerClass->at(k);
+		//std::cout << "numSampleReq " << numSampleReq << std::endl;
 		while(validSamples++<numSampleReq) {
 			sortedWeights[k].push_back( randBetween(0, 1, numSampleReq) );
 		}
@@ -443,5 +562,3 @@ int ClassifierRF<T>::WeightedSampling(const std::vector<size_t>* SamplesPerClass
 	}
 	return 0;
 }
-
-template class ClassifierRF<double>;
